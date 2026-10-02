@@ -21,7 +21,7 @@ from tkinter import ttk, messagebox, simpledialog
 from playwright.async_api import async_playwright
 
 APP_NAME = "인트리홀딩스 출근 자동 체크"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 CREDIT = "만든이: 도형이형"
 GITHUB_REPO = "raindevilrain-hub/intriholdings-attendance"  # owner/repo - 깃헙 릴리스에서 최신 버전을 확인한다
 # HTTP 헤더는 latin-1만 허용되어 한글 APP_NAME을 그대로 쓰면 UnicodeEncodeError가 난다.
@@ -67,6 +67,8 @@ DEFAULT = {
     "admin_pin_hash": None,
     "debug_show_browser": False,
     "shutdown_auto_checkout": False,  # 기본은 '물어보기'. 켜면 종료 시 묻지 않고 바로 퇴근 체크한다.
+    "auto_checkin_enabled": True,     # 꺼지면 부팅 자동 출근 체크 자체를 하지 않는다 (수동 버튼은 그대로 동작).
+    "shutdown_checkout_check_enabled": True,  # 꺼지면 종료 시 퇴근 체크를 아예 확인/처리하지 않는다.
 }
 
 
@@ -846,6 +848,8 @@ def _shutdown_decision(cfg):
     OFF_NETWORK만 영구 허용(래치): 사내망이 아닌 게 확인되면 이번 세션 내내 다시 묻지 않는다.
     NET_UNKNOWN(조회 실패)/ALREADY_DONE은 래치하지 않는다 — 인터넷이 잠깐 끊긴 것뿐일 수 있고,
     퇴근 여부도 그때그때 바뀌는데 래치해버리면 그날 남은 시간 동안 확인이 영영 안 뜬다."""
+    if not cfg.get("shutdown_checkout_check_enabled", True):
+        return "FEATURE_OFF"
     net = check_network(cfg, quick=True)
     if net == "no":
         return "OFF_NETWORK"
@@ -898,6 +902,8 @@ def _boot_checkin_worker(sleep=time.sleep):
     """자동 출근 체크 1회분. 사내망일 때만, 오늘 아직 안 했을 때만 실행한다.
     메시지 루프(종료 감시)를 막지 않도록 별도 스레드에서 돌리는 것을 전제로 한다."""
     cfg = load_config()
+    if not cfg.get("auto_checkin_enabled", True):
+        return
     if not cfg.get("office_public_ip") or already_checked_in_today() or checkin_already_asked_today():
         return
     ip = get_public_ip(timeout=4)
@@ -1037,7 +1043,7 @@ def watch_shutdown():
             if decision == "OFF_NETWORK":
                 allow["value"] = True   # 사내망이 아닌 게 확인됨 -> 이번 세션엔 다시 묻지 않는다
                 return 1
-            if decision in ("NET_UNKNOWN", "ALREADY_DONE"):
+            if decision in ("NET_UNKNOWN", "ALREADY_DONE", "FEATURE_OFF"):
                 return 1
 
             # 퇴근 미체크 상태. 정책: "체크될 때까지 매번 다시 물어본다" - 한 번 거절했다고
@@ -1516,12 +1522,24 @@ def admin_panel(parent):
     ttk.Button(frm, text="지금 이 네트워크를 회사망으로 등록", command=reset_ip, style="Secondary.TButton").pack(anchor="w", fill="x")
     ip_status.pack(anchor="w", pady=(6, 18))
 
-    debug_var = tk.BooleanVar(value=cfg.get("debug_show_browser", False))
-    ttk.Checkbutton(frm, text="자동화 실행 시 브라우저 창 표시 (디버그용)", variable=debug_var).pack(anchor="w", pady=(0, 10))
+    checkin_enabled_var = tk.BooleanVar(value=cfg.get("auto_checkin_enabled", True))
+    ttk.Checkbutton(frm, text="자동 출근 체크 사용", variable=checkin_enabled_var).pack(anchor="w")
+    ttk.Label(frm, text="끄면 부팅 시 출근 체크를 하지 않습니다 (수동 버튼은 그대로 동작)",
+              style="Hint.TLabel", wraplength=340).pack(anchor="w", pady=(0, 10))
+
+    checkout_check_var = tk.BooleanVar(value=cfg.get("shutdown_checkout_check_enabled", True))
+    ttk.Checkbutton(frm, text="종료 시 퇴근 체크 확인 사용", variable=checkout_check_var).pack(anchor="w")
+    ttk.Label(frm, text="끄면 종료할 때 퇴근 체크를 묻거나 처리하지 않고 바로 꺼집니다",
+              style="Hint.TLabel", wraplength=340).pack(anchor="w", pady=(0, 10))
 
     auto_checkout_var = tk.BooleanVar(value=cfg.get("shutdown_auto_checkout", False))
     ttk.Checkbutton(frm, text="종료 시 묻지 않고 바로 퇴근 체크 (기본: 물어보기)",
-                    variable=auto_checkout_var).pack(anchor="w", pady=(0, 18))
+                    variable=auto_checkout_var).pack(anchor="w")
+    ttk.Label(frm, text="위 '퇴근 체크 확인 사용'이 켜져 있을 때만 적용됩니다",
+              style="Hint.TLabel", wraplength=340).pack(anchor="w", pady=(0, 18))
+
+    debug_var = tk.BooleanVar(value=cfg.get("debug_show_browser", False))
+    ttk.Checkbutton(frm, text="자동화 실행 시 브라우저 창 표시 (디버그용)", variable=debug_var).pack(anchor="w", pady=(0, 18))
 
     status_holder = ttk.Frame(frm, style="Card.TFrame"); status_holder.pack(fill="x")
     def redraw():
@@ -1565,6 +1583,8 @@ def admin_panel(parent):
         c = load_config()
         c["debug_show_browser"] = debug_var.get()
         c["shutdown_auto_checkout"] = auto_checkout_var.get()
+        c["auto_checkin_enabled"] = checkin_enabled_var.get()
+        c["shutdown_checkout_check_enabled"] = checkout_check_var.get()
         save_config(c)
         win.destroy()
     ttk.Button(frm, text="저장하고 닫기", command=do_save, style="Accent.TButton").pack(fill="x", pady=(20, 0))
