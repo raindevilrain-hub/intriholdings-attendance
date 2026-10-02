@@ -21,7 +21,7 @@ from tkinter import ttk, messagebox, simpledialog
 from playwright.async_api import async_playwright
 
 APP_NAME = "인트리홀딩스 출근 자동 체크"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 CREDIT = "만든이: 도형이형"
 GITHUB_REPO = "raindevilrain-hub/intriholdings-attendance"  # owner/repo - 깃헙 릴리스에서 최신 버전을 확인한다
 # HTTP 헤더는 latin-1만 허용되어 한글 APP_NAME을 그대로 쓰면 UnicodeEncodeError가 난다.
@@ -66,6 +66,7 @@ DEFAULT = {
     "admin_pin_salt": None,
     "admin_pin_hash": None,
     "debug_show_browser": False,
+    "shutdown_auto_checkout": False,  # 기본은 '물어보기'. 켜면 종료 시 묻지 않고 바로 퇴근 체크한다.
 }
 
 
@@ -1042,8 +1043,11 @@ def watch_shutdown():
             # 퇴근 미체크 상태. 정책: "체크될 때까지 매번 다시 물어본다" - 한 번 거절했다고
             # 다음 종료 시도부터 묻지 않으면, 결국 퇴근 체크 없이 넘어가는 날이 생긴다.
             busy["value"] = True
-            _set_block_reason(hwnd, "퇴근 체크가 아직 안 되어 있습니다. 화면이 멈춘 것처럼 보이면 [취소]를 누르고 안내창에서 선택해 주세요.")
-            answer = _confirm_checkout_dialog()
+            if cfg.get("shutdown_auto_checkout"):
+                answer = "yes"  # 관리자 설정: 묻지 않고 바로 처리
+            else:
+                _set_block_reason(hwnd, "퇴근 체크가 아직 안 되어 있습니다. 화면이 멈춘 것처럼 보이면 [취소]를 누르고 안내창에서 선택해 주세요.")
+                answer = _confirm_checkout_dialog()
 
             if answer == "away":
                 # 자리에 사람이 없다 -> 이번 종료는 막지 않는다 (예약 재부팅이 밤새 취소되면 안 된다).
@@ -1489,7 +1493,7 @@ def open_admin(parent):
 def admin_panel(parent):
     cfg = load_config()
     win = tk.Toplevel(parent); win.title(f"{APP_NAME} - 관리자 설정")
-    win.geometry("420x600"); win.resizable(False, False)
+    win.geometry("420x200"); win.resizable(False, False)  # 높이는 내용을 다 채운 뒤 실제 필요한 만큼으로 다시 잡는다(아래)
     win.configure(bg=COLOR_BG)
     frm = _card(win, pad=24)
 
@@ -1513,7 +1517,11 @@ def admin_panel(parent):
     ip_status.pack(anchor="w", pady=(6, 18))
 
     debug_var = tk.BooleanVar(value=cfg.get("debug_show_browser", False))
-    ttk.Checkbutton(frm, text="자동화 실행 시 브라우저 창 표시 (디버그용)", variable=debug_var).pack(anchor="w", pady=(0, 18))
+    ttk.Checkbutton(frm, text="자동화 실행 시 브라우저 창 표시 (디버그용)", variable=debug_var).pack(anchor="w", pady=(0, 10))
+
+    auto_checkout_var = tk.BooleanVar(value=cfg.get("shutdown_auto_checkout", False))
+    ttk.Checkbutton(frm, text="종료 시 묻지 않고 바로 퇴근 체크 (기본: 물어보기)",
+                    variable=auto_checkout_var).pack(anchor="w", pady=(0, 18))
 
     status_holder = ttk.Frame(frm, style="Card.TFrame"); status_holder.pack(fill="x")
     def redraw():
@@ -1556,9 +1564,13 @@ def admin_panel(parent):
     def do_save():
         c = load_config()
         c["debug_show_browser"] = debug_var.get()
+        c["shutdown_auto_checkout"] = auto_checkout_var.get()
         save_config(c)
         win.destroy()
     ttk.Button(frm, text="저장하고 닫기", command=do_save, style="Accent.TButton").pack(fill="x", pady=(20, 0))
+
+    win.update_idletasks()
+    win.geometry(f"420x{frm.winfo_reqheight() + 16}")
 
 
 # ---------- 설치 / 제거 (EXE 하나가 설치 프로그램을 겸한다) ----------
