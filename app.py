@@ -24,6 +24,8 @@ APP_NAME = "인트리홀딩스 출근 자동 체크"
 APP_VERSION = "1.1.0"
 CREDIT = "만든이: 도형이형"
 GITHUB_REPO = "raindevilrain-hub/intriholdings-attendance"  # owner/repo - 깃헙 릴리스에서 최신 버전을 확인한다
+# HTTP 헤더는 latin-1만 허용되어 한글 APP_NAME을 그대로 쓰면 UnicodeEncodeError가 난다.
+UPDATE_USER_AGENT = "IntriHoldingsAttendance-UpdateChecker"
 
 # 카드-온-그레이 대비 없이 창 전체를 흰 배경 하나로 통일하고(COLOR_BG == COLOR_CARD),
 # 포인트 컬러도 채도를 낮춰서 하이웍스 로그인 화면처럼 플랫한 톤으로 맞춘다.
@@ -1788,7 +1790,7 @@ def check_for_update(timeout=6):
     try:
         req = urllib.request.Request(
             f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
-            headers={"Accept": "application/vnd.github+json", "User-Agent": APP_NAME})
+            headers={"Accept": "application/vnd.github+json", "User-Agent": UPDATE_USER_AGENT})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             rel = json.loads(r.read().decode())
         if _version_tuple(rel.get("tag_name", "")) <= _version_tuple(APP_VERSION):
@@ -1806,7 +1808,7 @@ def apply_update(download_url, timeout=120):
     복사가 끝나기 전에 죽을 수 있다. 그래서 받은 exe를 별도 프로세스로 띄워 그쪽이 기존 걸 정리하고
     설치하게 한다 (완전히 다른 PID라 자기 자신을 건드릴 위험이 없다)."""
     try:
-        req = urllib.request.Request(download_url, headers={"User-Agent": APP_NAME})
+        req = urllib.request.Request(download_url, headers={"User-Agent": UPDATE_USER_AGENT})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             data = r.read()
         if len(data) < 1_000_000 or data[:2] != b"MZ":  # 너무 작거나 exe 형식이 아니면 받다 만 것
