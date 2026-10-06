@@ -21,11 +21,16 @@ from tkinter import ttk, messagebox, simpledialog
 from playwright.async_api import async_playwright
 
 APP_NAME = "인트리홀딩스 출근 자동 체크"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 CREDIT = "만든이: 도형이형"
 GITHUB_REPO = "raindevilrain-hub/intriholdings-attendance"  # owner/repo - 깃헙 릴리스에서 최신 버전을 확인한다
 # HTTP 헤더는 latin-1만 허용되어 한글 APP_NAME을 그대로 쓰면 UnicodeEncodeError가 난다.
 UPDATE_USER_AGENT = "IntriHoldingsAttendance-UpdateChecker"
+# 릴리스에 올리는 exe 파일명. 영문 고정이어야 한다(한글/공백이면 깃헙이 default.exe로 깨뜨린다).
+UPDATE_ASSET_NAME = "IntriHoldingsAttendance-Setup.exe"
+UPDATE_RECHECK_SEC = 6 * 3600         # 켜져 있는 동안의 새 버전 확인 간격 (프로그램/PC가 켜질 때는 무조건 확인)
+UPDATE_SAME_TAG_RETRY_SEC = 24 * 3600  # 같은 버전 설치를 이 시간 안에 또 시도하지 않는다 (무한 재설치 방지)
+UPDATE_HANDOFF_SEC = 180               # 설치 프로세스가 이 감시기를 정리해 줄 때까지 기다리는 시간
 
 # 카드-온-그레이 대비 없이 창 전체를 흰 배경 하나로 통일하고(COLOR_BG == COLOR_CARD),
 # 포인트 컬러도 채도를 낮춰서 하이웍스 로그인 화면처럼 플랫한 톤으로 맞춘다.
@@ -125,11 +130,12 @@ def checkin_already_asked_today():
 def mark_checkin_asked():
     s = load_state(); s["checkin_asked_date"] = dt.date.today().isoformat(); save_state(s)
 
-def update_already_checked_today():
-    return load_state().get("update_checked_date") == dt.date.today().isoformat()
+def update_recently_checked():
+    """깃헙에 '실제로 응답을 받은' 마지막 확인 시각 기준. 접속 실패는 확인으로 치지 않는다."""
+    return time.time() - load_state().get("update_ok_ts", 0) < UPDATE_RECHECK_SEC
 
 def mark_update_checked():
-    s = load_state(); s["update_checked_date"] = dt.date.today().isoformat(); save_state(s)
+    s = load_state(); s["update_ok_ts"] = time.time(); save_state(s)
 
 def already_checked_out_today():
     return load_state().get("checkout_date") == dt.date.today().isoformat()
@@ -716,7 +722,7 @@ WM_TRAY = 0x0400 + 1          # WM_APP+1: 트레이 아이콘이 클릭을 알�
 TRAY_UID = 1
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO = 0x01, 0x02, 0x04, 0x10
-MENU_CHECKIN, MENU_CHECKOUT, MENU_OPEN, MENU_QUIT, MENU_ASSUME_CHECKIN = 101, 102, 103, 104, 105
+MENU_CHECKIN, MENU_CHECKOUT, MENU_OPEN, MENU_QUIT, MENU_ASSUME_CHECKIN, MENU_UPDATE = 101, 102, 103, 104, 105, 106
 
 class NOTIFYICONDATAW(ctypes.Structure):
     _fields_ = [
@@ -821,6 +827,7 @@ def _tray_menu(hwnd):
         assume = MF_CHECKED if load_config().get("auto_confirm_already_checked_in") else 0
         u.AppendMenuW(menu, MF_STRING | assume, MENU_ASSUME_CHECKIN, "이미 출근했으면 묻지 않기")
         u.AppendMenuW(menu, MF_STRING, MENU_OPEN, "상태 창 열기")
+        u.AppendMenuW(menu, MF_STRING, MENU_UPDATE, f"업데이트 확인 (현재 v{APP_VERSION})")
         u.AppendMenuW(menu, MF_STRING, MENU_QUIT, "종료(자동 출퇴근 중지)")
         pt = wintypes.POINT()
         u.GetCursorPos(ctypes.byref(pt))
@@ -853,6 +860,29 @@ def _tray_action(mode, hwnd):
         label = "출근" if mode == "checkin" else "퇴근"
         _msgbox_timeout(f"{label} 체크 결과\n\n{info}", APP_NAME,
                         0x40 if ok else MB_ICONWARNING, timeout_ms=15000)
+    threading.Thread(target=work, daemon=True).start()
+
+def _tray_update_action():
+    """트레이 메뉴 '업데이트 확인'. 네트워크를 쓰므로 메시지 루프를 막지 않게 스레드에서 돈다."""
+    def work():
+        status, url, tag = update_status()
+        if status == "error":
+            _msgbox_timeout("업데이트 확인에 실패했습니다.\n인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
+                            APP_NAME, MB_ICONWARNING, timeout_ms=15000)
+        elif status == "latest":
+            _msgbox_timeout(f"현재 최신 버전입니다. (v{APP_VERSION})", APP_NAME, MB_ICONINFORMATION, timeout_ms=8000)
+        else:
+            r = _msgbox_timeout(f"새 버전 {tag}이(가) 있습니다. 지금 업데이트할까요?\n\n"
+                                "설치하는 동안 프로그램이 잠깐 닫혔다가 다시 시작됩니다.",
+                                APP_NAME, MB_YESNO | MB_ICONQUESTION, timeout_ms=60000)
+            if r != IDYES:
+                return
+            if _automation_busy():
+                _msgbox_timeout("출근/퇴근 체크가 진행 중입니다. 끝난 뒤 다시 눌러 주세요.",
+                                APP_NAME, MB_ICONINFORMATION, timeout_ms=15000)
+            elif not apply_update(url):
+                _msgbox_timeout("업데이트를 내려받지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                                APP_NAME, MB_ICONWARNING, timeout_ms=15000)
     threading.Thread(target=work, daemon=True).start()
 
 def _open_status_window():
@@ -912,13 +942,25 @@ def _daily_checkin_loop(sleep=time.sleep, once=False):
     """로그온 직후 한 번 출근 체크하고, 그 뒤로도 날짜가 바뀌면 다시 체크한다.
     PC를 끄지 않고 계속 켜두는 사람은 재부팅이 없어서, 이 루프가 없으면 다음날 출근 체크가
     영영 실행되지 않는다."""
+    first = True
     while True:
+        # 출근 체크보다 먼저 업데이트를 본다: 새 버전이 있으면 그걸로 갈아탄 뒤에 출근 체크하는 게 맞다.
+        # 첫 바퀴(= 프로그램을 켰거나 PC가 켜진 직후)는 하루/6시간 제한 없이 무조건 확인한다.
+        updating = False
         try:
-            _boot_checkin_worker(sleep=sleep)
+            updating = _maybe_auto_update(startup=first)
         except Exception:
             pass
+        first = False
+        if updating:
+            # 설치 프로세스가 곧 이 감시기를 닫고 새 버전을 띄운다. 그 사이에 출근 체크 브라우저를 열면
+            # 중간에 끊겨서 Edge가 고아로 남을 수 있으니 기다린다 (그래도 안 닫히면 다음 바퀴에 평소대로).
+            if once:
+                return
+            sleep(UPDATE_HANDOFF_SEC)
+            continue
         try:
-            _maybe_auto_update()
+            _boot_checkin_worker(sleep=sleep)
         except Exception:
             pass
         if once:
@@ -1152,6 +1194,8 @@ def watch_shutdown():
                         _tray_action("checkout", hwnd)
                     elif choice == MENU_OPEN:
                         _open_status_window()
+                    elif choice == MENU_UPDATE:
+                        _tray_update_action()
                     elif choice == MENU_ASSUME_CHECKIN:
                         c = load_config()
                         c["auto_confirm_already_checked_in"] = not c.get("auto_confirm_already_checked_in")
@@ -1194,6 +1238,10 @@ def watch_shutdown():
 
     _tray_add(hwnd, _tray_tip())
     _log(f"감시기 시작 v{APP_VERSION} pid={os.getpid()}")
+    try:
+        _clean_relay_copies()  # 직전 자동 업데이트가 남긴 설치 파일 정리
+    except Exception:
+        pass
 
     # 부팅 시 자동 출근 체크: 성공하면 알림 없이 넘어가고(미니멀 UI), 끝내 실패했을 때만 알린다.
     # 별도 스레드로 돌려서 메시지 루프가 바로 시작되게 한다 (종료 질의에 즉시 답해야 하므로).
@@ -1482,6 +1530,55 @@ def main_window(auto_minimize=True):
     bottom = ttk.Frame(frm, style="Card.TFrame")
     bottom.pack(side="bottom", fill="x", pady=(10, 0))
     _credit_label(bottom, on_secret_click=lambda: (cancel_auto_minimize(), open_admin(root)))
+
+    # ---- 버전 / 업데이트 확인 ----
+    ver_row = ttk.Frame(bottom, style="Card.TFrame"); ver_row.pack(side="top", fill="x", pady=(4, 10))
+    ver_lbl = ttk.Label(ver_row, text=f"v{APP_VERSION}", style="Hint.TLabel", wraplength=250)
+    ver_lbl.pack(side="left")
+    upd_btn = ttk.Button(ver_row, text="업데이트 확인", style="Secondary.TButton")
+    upd_btn.pack(side="right")
+    buttons.append(upd_btn)
+    upd = {"url": None, "tag": None}
+
+    def show_update_status(r):
+        status, url, tag = r
+        if status == "newer":
+            upd["url"], upd["tag"] = url, tag
+            ver_lbl.configure(text=f"v{APP_VERSION} → {tag} 업데이트 가능")
+            upd_btn.configure(text="지금 업데이트")
+        elif status == "latest":
+            upd["url"] = None
+            ver_lbl.configure(text=f"v{APP_VERSION} (최신 버전입니다)")
+            upd_btn.configure(text="업데이트 확인")
+        else:
+            ver_lbl.configure(text=f"v{APP_VERSION} (확인 실패 - 인터넷 연결을 확인하세요)")
+        upd_btn.configure(state="normal")
+
+    def check_update():
+        upd_btn.configure(state="disabled")
+        ver_lbl.configure(text=f"v{APP_VERSION} (확인 중...)")
+        _run_in_thread(root, update_status, show_update_status)
+
+    def apply_now():
+        if not messagebox.askyesno("업데이트", f"새 버전 {upd['tag']}을(를) 설치할까요?\n\n"
+                                   "설치하는 동안 프로그램이 잠깐 닫혔다가 다시 시작됩니다.", parent=root):
+            return
+        set_busy(True)
+        ver_lbl.configure(text="내려받는 중... 끝나면 프로그램이 자동으로 다시 시작됩니다")
+        def done(ok):
+            if not ok:  # 성공하면 설치 프로세스가 곧 이 창을 닫는다
+                set_busy(False)
+                ver_lbl.configure(text=f"v{APP_VERSION} (업데이트를 내려받지 못했습니다 - 잠시 후 다시 시도)")
+        _run_in_thread(root, lambda: apply_update(upd["url"]), done)
+
+    def on_update_click():
+        cancel_auto_minimize()
+        if upd["url"]:
+            apply_now()
+        else:
+            check_update()
+    upd_btn.configure(command=on_update_click)
+
     row = ttk.Frame(bottom, style="Card.TFrame"); row.pack(side="bottom", fill="x")
     bi = ttk.Button(row, text="지금 출근 체크", command=lambda: manual("checkin"), style="Accent.TButton")
     bo = ttk.Button(row, text="지금 퇴근 체크", command=lambda: manual("checkout"), style="Secondary.TButton")
@@ -1505,6 +1602,8 @@ def main_window(auto_minimize=True):
               style="Hint.TLabel", wraplength=360).pack(side="bottom", anchor="w", pady=(0, 6))
     ttk.Checkbutton(bottom, text="이미 출근했으면 묻지 않기", variable=assume_var,
                     command=save_assume).pack(side="bottom", anchor="w")
+
+    check_update()  # 창을 열 때 한 번 확인해서 버전 줄에 바로 보여준다
 
     if logged_in and auto_minimize:
         state["minimize_job"] = root.after(AUTO_MINIMIZE_MS, root.iconify)
@@ -1673,15 +1772,34 @@ def _clean_relay_copies():
     """제거용으로 %TEMP%에 복사해 둔 사본을 정리한다 (48MB짜리가 계속 쌓이면 안 된다).
     지금 실행 중인 사본은 자신을 못 지우므로 다음 설치/제거 때 정리된다."""
     me = Path(sys.executable).resolve() if _is_frozen() else None
-    for f in _app_root("TEMP").glob("intri_uninstall_*.exe"):
-        try:
-            if me is None or f.resolve() != me:
-                f.unlink()
-        except Exception:
-            pass
+    # 자동 업데이트가 받아 둔 설치 파일(intri_update_*.exe, 48MB)도 같이 정리한다.
+    for pattern in ("intri_uninstall_*.exe", "intri_update_*.exe"):
+        for f in _app_root("TEMP").glob(pattern):
+            try:
+                if me is None or f.resolve() != me:
+                    f.unlink()
+            except Exception:
+                pass  # 아직 실행 중인 설치 프로세스의 파일은 못 지운다 - 다음 기회에
 
 def _ask_yesno(text):
     return ctypes.windll.user32.MessageBoxW(0, text, APP_NAME, MB_YESNO | MB_ICONQUESTION) == IDYES
+
+def _ensure_watcher_running():
+    """설치된 프로그램의 창(상태/설정)을 열 때 감시기(종료 확인·자동 출근·업데이트 확인)가 안 떠 있으면
+    다시 띄운다. 트레이에서 '종료'했거나 감시기가 죽은 뒤 프로그램을 다시 켜면 기능이 전부 같이 돌아와야 한다.
+    감시기는 뮤텍스로 하나만 살아남으니 중복으로 띄워도 안전하다."""
+    try:
+        if not (_is_frozen() and _running_from_install_dir()):
+            return
+        u = ctypes.windll.user32
+        u.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        u.FindWindowW.restype = ctypes.c_void_p
+        if u.FindWindowW(WATCHER_CLASS, None):
+            return
+        subprocess.Popen([sys.executable, "watch"], creationflags=0x00000008 | 0x00000200,
+                         close_fds=True, cwd=str(INSTALL_DIR))
+    except Exception:
+        pass
 
 def _stop_watcher(timeout=15.0):
     """실행 중인 종료 감시기를 창 메시지(WM_CLOSE)로 정상 종료시키고, 프로세스가 완전히
@@ -1870,22 +1988,50 @@ def _version_tuple(v):
         except ValueError: parts.append(0)
     return tuple(parts)
 
-def check_for_update(timeout=6):
-    """깃헙 최신 릴리스를 조회한다. 더 새 버전이 있으면 (True, exe 다운로드 URL, 태그), 아니면 (False, None, None)."""
+def _latest_release_tag(timeout=6):
+    """깃헙 최신 릴리스 태그. 웹의 '/releases/latest' 리다이렉트로 읽는다 - API는 공인 IP당 시간당 60회
+    제한이라, 사무실 PC들이 한 IP로 아침에 몰려 켜질 때마다 확인하면 막힌다.
+    접속 실패는 None, 릴리스가 아직 하나도 없으면 ''."""
     try:
-        req = urllib.request.Request(
-            f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
-            headers={"Accept": "application/vnd.github+json", "User-Agent": UPDATE_USER_AGENT})
+        req = urllib.request.Request(f"https://github.com/{GITHUB_REPO}/releases/latest",
+                                     headers={"User-Agent": UPDATE_USER_AGENT})
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            rel = json.loads(r.read().decode())
-        if _version_tuple(rel.get("tag_name", "")) <= _version_tuple(APP_VERSION):
-            return False, None, None
-        for asset in rel.get("assets", []):
-            if asset.get("name", "").endswith(".exe"):
-                return True, asset.get("browser_download_url"), rel.get("tag_name")
-        return False, None, None
+            final = r.geturl()
+        return final.rstrip("/").rsplit("/", 1)[-1] if "/releases/tag/" in final else ""
     except Exception:
-        return False, None, None
+        return None
+
+def update_status(timeout=6):
+    """('newer', 다운로드 URL, 태그) / ('latest', None, 태그) / ('error', None, None).
+    '최신 버전이다'와 '확인 자체를 못 했다'를 구분해야, 접속 실패를 확인 완료로 착각하지 않는다."""
+    tag = _latest_release_tag(timeout)
+    if tag is None:
+        return "error", None, None
+    if not tag or _version_tuple(tag) <= _version_tuple(APP_VERSION):
+        return "latest", None, tag or None
+    return "newer", f"https://github.com/{GITHUB_REPO}/releases/download/{tag}/{UPDATE_ASSET_NAME}", tag
+
+def _automation_busy():
+    """이 프로세스든 다른 프로세스(상태 창)든 브라우저 자동화가 도는 중인가?
+    도는 중에 프로그램을 갈아끼우면 Edge가 고아로 남아 프로필이 잠길 수 있다."""
+    if _ATTEND_LOCK.locked():
+        return True
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    k.CreateMutexW.restype = ctypes.c_void_p
+    k.WaitForSingleObject.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    k.ReleaseMutex.argtypes = [ctypes.c_void_p]
+    k.CloseHandle.argtypes = [ctypes.c_void_p]
+    h = k.CreateMutexW(None, False, BROWSER_MUTEX_NAME)
+    if not h:
+        return False
+    try:
+        if k.WaitForSingleObject(h, 0) in (0, 0x80):  # 바로 잡혔다 = 아무도 안 쓰는 중
+            k.ReleaseMutex(h)
+            return False
+        return True
+    finally:
+        k.CloseHandle(h)
 
 def apply_update(download_url, timeout=120):
     """새 버전을 받아 'install' 명령으로 스스로 설치시킨다 (install_app()과 동일한, 이미 검증된 경로).
@@ -1906,14 +2052,42 @@ def apply_update(download_url, timeout=120):
     except Exception:
         return False
 
-def _maybe_auto_update():
-    """하루 한 번만 확인한다. 실패해도(네트워크 없음 등) 조용히 넘어간다 - 출근 체크를 방해하면 안 된다."""
-    if update_already_checked_today():
-        return
-    mark_update_checked()
-    newer, url, _tag = check_for_update()
-    if newer and url:
-        apply_update(url)
+def _maybe_auto_update(startup=False):
+    """프로그램/PC가 켜질 때(startup)는 무조건 확인하고, 켜져 있는 동안엔 UPDATE_RECHECK_SEC마다 확인한다.
+    설치를 시작했으면 True. 실패해도(네트워크 없음 등) 조용히 넘어간다 - 출근 체크를 방해하면 안 된다.
+    접속 자체가 실패하면 '확인했다'고 기록하지 않아서 다음 바퀴(10분 뒤)에 다시 시도한다."""
+    if not startup and update_recently_checked():
+        return False
+    status, url, tag = update_status()
+    if status == "error":
+        _log_change("update", "업데이트 확인 실패 (인터넷/깃헙 접속 불가) - 나중에 다시 시도")
+        return False
+    if status == "latest":
+        mark_update_checked()
+        _log_change("update", f"업데이트 확인: 최신 버전입니다 (v{APP_VERSION})")
+        return False
+
+    s = load_state()
+    att = s.get("update_attempt") or {}
+    if att.get("tag") == tag and time.time() - att.get("ts", 0) < UPDATE_SAME_TAG_RETRY_SEC:
+        # 같은 버전을 방금 설치했는데도 여전히 구버전이면(릴리스 exe의 APP_VERSION이 태그보다 낮은 실수 등)
+        # 켜질 때마다 다시 설치하는 무한 반복에 빠진다 -> 같은 버전은 하루에 한 번만 시도한다.
+        mark_update_checked()
+        _log_change("update", f"업데이트 {tag}: 최근에 이미 설치를 시도해서 건너뜀")
+        return False
+    if _automation_busy():
+        _log_change("update", f"업데이트 {tag}: 출근/퇴근 자동화가 실행 중이라 보류 (곧 다시 시도)")
+        return False
+
+    _log(f"업데이트 {tag} 설치 시작 (현재 v{APP_VERSION})")
+    s["update_attempt"] = {"tag": tag, "ts": time.time()}
+    save_state(s)
+    ok = apply_update(url)
+    if not ok:
+        s = load_state(); s.pop("update_attempt", None); save_state(s)
+        _log(f"업데이트 {tag}: 다운로드/검증 실패")
+    mark_update_checked()  # 실패해도 곧바로 50MB씩 반복해서 받지 않도록 다음 확인은 UPDATE_RECHECK_SEC 뒤에
+    return ok
 
 def install_app(confirm=False, silent=False):
     """EXE 자신을 %LOCALAPPDATA%에 복사하고, 로그온 자동 실행/바로가기/설치된 앱 항목을 등록한다.
@@ -2038,8 +2212,10 @@ def main():
     elif cmd == "uninstall":
         sys.exit(0 if uninstall_app(silent=silent, relay="/relay" in args) else 1)
     elif cmd == "setup":
+        _ensure_watcher_running()
         setup_gui()
     elif cmd == "status":
+        _ensure_watcher_running()
         status_window()
     elif cmd == "checkin":
         cfg = load_config()
