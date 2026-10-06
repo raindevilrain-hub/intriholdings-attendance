@@ -21,7 +21,7 @@ from tkinter import ttk, messagebox, simpledialog
 from playwright.async_api import async_playwright
 
 APP_NAME = "인트리홀딩스 출근 자동 체크"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 CREDIT = "만든이: 도형이형"
 GITHUB_REPO = "raindevilrain-hub/intriholdings-attendance"  # owner/repo - 깃헙 릴리스에서 최신 버전을 확인한다
 # HTTP 헤더는 latin-1만 허용되어 한글 APP_NAME을 그대로 쓰면 UnicodeEncodeError가 난다.
@@ -73,6 +73,14 @@ def _log(msg):
             ACTIVITY_LOG.replace(ACTIVITY_LOG.with_suffix(".log.old"))
         with open(ACTIVITY_LOG, "a", encoding="utf-8") as f:
             f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+    except Exception:
+        pass
+
+def _log_exc(where):
+    """백그라운드 스레드의 예외는 아무도 못 본다. 삼키기만 하면 '왜 안 돌았지'를 영영 알 수 없게 되므로 기록한다."""
+    try:
+        import traceback
+        _log(f"{where} 오류: {traceback.format_exc(limit=-6).strip()[-900:]}")
     except Exception:
         pass
 
@@ -950,7 +958,7 @@ def _daily_checkin_loop(sleep=time.sleep, once=False):
         try:
             updating = _maybe_auto_update(startup=first)
         except Exception:
-            pass
+            _log_exc("업데이트 확인")
         first = False
         if updating:
             # 설치 프로세스가 곧 이 감시기를 닫고 새 버전을 띄운다. 그 사이에 출근 체크 브라우저를 열면
@@ -962,7 +970,7 @@ def _daily_checkin_loop(sleep=time.sleep, once=False):
         try:
             _boot_checkin_worker(sleep=sleep)
         except Exception:
-            pass
+            _log_exc("자동 출근 체크")
         if once:
             return
         sleep(DAILY_POLL_SEC)
@@ -974,8 +982,18 @@ def _boot_checkin_worker(sleep=time.sleep):
     if not cfg.get("auto_checkin_enabled", True):
         _log_change("boot", "자동 출근 체크: 꺼져 있어 건너뜀")
         return
-    if not cfg.get("office_public_ip") or already_checked_in_today() or checkin_already_asked_today():
-        return  # 10분마다 도는 정상 경로라 기록하지 않는다
+    # 10분마다 도는 정상 경로라 같은 이유는 한 번만 기록한다(_log_change). 이유를 안 남기면
+    # '왜 오늘 출근 체크가 안 돌았지?'를 나중에 알 방법이 없다.
+    if not cfg.get("office_public_ip"):
+        _log_change("boot", "자동 출근 체크 건너뜀: 회사망이 아직 등록되지 않음")
+        return
+    if already_checked_in_today():
+        _log_change("boot", "자동 출근 체크 건너뜀: 오늘 출근 기록이 이미 있음")
+        return
+    if checkin_already_asked_today():
+        _log_change("boot", "자동 출근 체크 건너뜀: 오늘 '이미 출근하셨나요?'를 이미 물어봄")
+        return
+    _log_change("boot", "자동 출근 체크: 시작 (사내망 확인 중)")
     ip = get_public_ip(timeout=4)
     waited = 0
     while ip is None and waited < BOOT_NET_WAIT_SEC:
