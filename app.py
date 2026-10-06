@@ -21,7 +21,7 @@ from tkinter import ttk, messagebox, simpledialog
 from playwright.async_api import async_playwright
 
 APP_NAME = "인트리홀딩스 출근 자동 체크"
-APP_VERSION = "1.5.2"
+APP_VERSION = "1.5.3"
 CREDIT = "만든이: 도형이형"
 GITHUB_REPO = "raindevilrain-hub/intriholdings-attendance"  # owner/repo - 깃헙 릴리스에서 최신 버전을 확인한다
 # HTTP 헤더는 latin-1만 허용되어 한글 APP_NAME을 그대로 쓰면 UnicodeEncodeError가 난다.
@@ -1240,6 +1240,8 @@ def watch_shutdown():
                 return 1
 
         if msg == WM_ENDSESSION:
+            # wParam이 0이 아니면 Windows가 세션을 실제로 끝낸다(종료/재시작/로그오프 확정). 0이면 누가 취소한 것.
+            _log(f"세션 종료 {'확정' if wparam else '취소됨'} (WM_ENDSESSION lparam=0x{lparam:08X})")
             return 0
 
         if msg == WM_TRAY:
@@ -1269,6 +1271,7 @@ def watch_shutdown():
                         save_config(c)
                     elif choice == MENU_QUIT:
                         if _confirm_tray_quit():
+                            _log("감시기 종료: 트레이 메뉴에서 '종료'를 선택함")
                             _tray_remove(hwnd)
                             user32.PostQuitMessage(0)
                 elif ev == WM_LBUTTONDBLCLK:
@@ -1278,6 +1281,7 @@ def watch_shutdown():
             return 0
 
         if msg in (WM_CLOSE, WM_DESTROY):
+            _log("감시기 종료: 창 닫힘 메시지 수신 (업데이트/재설치가 닫았거나 직접 종료)")
             _tray_remove(hwnd)
             user32.PostQuitMessage(0)
             return 0
