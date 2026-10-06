@@ -21,7 +21,7 @@ from tkinter import ttk, messagebox, simpledialog
 from playwright.async_api import async_playwright
 
 APP_NAME = "인트리홀딩스 출근 자동 체크"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 CREDIT = "만든이: 도형이형"
 GITHUB_REPO = "raindevilrain-hub/intriholdings-attendance"  # owner/repo - 깃헙 릴리스에서 최신 버전을 확인한다
 # HTTP 헤더는 latin-1만 허용되어 한글 APP_NAME을 그대로 쓰면 UnicodeEncodeError가 난다.
@@ -58,6 +58,26 @@ DASHBOARD_URL = "https://dashboard.office.hiworks.com/"
 LOGIN_MARKER = "login.office.hiworks.com"
 COOKIE_DOMAIN_MARKER = "hiworks"
 DEBUG_DIR = APP_DIR / "debug"
+ACTIVITY_LOG = APP_DIR / "activity.log"
+
+def _log(msg):
+    """종료/출근 판단 근거를 남긴다. '왜 안 물어봤지?'를 추측이 아니라 기록으로 확인하기 위함.
+    기록 실패가 본 기능을 건드리면 안 되므로 어떤 오류도 삼킨다."""
+    try:
+        if ACTIVITY_LOG.exists() and ACTIVITY_LOG.stat().st_size > 200_000:
+            ACTIVITY_LOG.replace(ACTIVITY_LOG.with_suffix(".log.old"))
+        with open(ACTIVITY_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+    except Exception:
+        pass
+
+_LOG_LAST = {}
+
+def _log_change(key, msg):
+    """같은 상황이 10분마다 반복될 때 로그가 도배되지 않도록, 직전과 다를 때만 남긴다."""
+    if _LOG_LAST.get(key) != msg:
+        _LOG_LAST[key] = msg
+        _log(msg)
 
 DEFAULT = {
     "shutdown_delay": 2,
@@ -69,6 +89,7 @@ DEFAULT = {
     "shutdown_auto_checkout": False,  # 기본은 '물어보기'. 켜면 종료 시 묻지 않고 바로 퇴근 체크한다.
     "auto_checkin_enabled": True,     # 꺼지면 부팅 자동 출근 체크 자체를 하지 않는다 (수동 버튼은 그대로 동작).
     "shutdown_checkout_check_enabled": True,  # 꺼지면 종료 시 퇴근 체크를 아예 확인/처리하지 않는다.
+    "auto_confirm_already_checked_in": False,  # 켜면 하이웍스가 이미 '출근' 상태일 때 묻지 않고 오늘 출근 완료로 기록한다.
 }
 
 
@@ -391,7 +412,8 @@ def _ask_already_checked_in():
         "오늘 출근 체크를 이미 하셨나요?\n\n"
         "예    → 오늘 출근 완료로 기록합니다\n"
         "아니오 → 어제 퇴근 체크가 빠진 것일 수 있으니 하이웍스에서 직접 확인하세요\n\n"
-        f"{CONFIRM_TIMEOUT_MS // 1000}초간 응답이 없으면 '아니오'로 처리합니다.",
+        f"{CONFIRM_TIMEOUT_MS // 1000}초간 응답이 없으면 '아니오'로 처리합니다.\n"
+        "(다시 묻지 않으려면 트레이 아이콘 우클릭 → '이미 출근했으면 묻지 않기'를 체크하세요)",
         APP_NAME, MB_YESNO | MB_ICONQUESTION, CONFIRM_TIMEOUT_MS)
     return r == IDYES
 
@@ -421,6 +443,10 @@ async def _do_checkin(page, interactive=False):
         #  (2) 어제 퇴근 체크가 빠져서 버튼이 그대로 남아 있다
         # 화면만으로는 구분할 수 없으니, 사람이 앞에 있을 때는 물어보고,
         # 자동 실행(부팅)일 때는 함부로 기록하지 않는다.
+        # 단, 사용자가 '이미 출근했으면 묻지 않기'를 켜 두었다면 묻지 않고 완료로 기록한다.
+        if load_config().get("auto_confirm_already_checked_in"):
+            mark_checkin()
+            return True, "이미 출근 상태로 확인되어, 오늘 출근 완료로 기록했습니다."
         if interactive:
             mark_checkin_asked()  # 답이 뭐였든 오늘은 이 질문을 다시 띄우지 않는다
             if _ask_already_checked_in():
@@ -690,7 +716,7 @@ WM_TRAY = 0x0400 + 1          # WM_APP+1: 트레이 아이콘이 클릭을 알�
 TRAY_UID = 1
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO = 0x01, 0x02, 0x04, 0x10
-MENU_CHECKIN, MENU_CHECKOUT, MENU_OPEN, MENU_QUIT = 101, 102, 103, 104
+MENU_CHECKIN, MENU_CHECKOUT, MENU_OPEN, MENU_QUIT, MENU_ASSUME_CHECKIN = 101, 102, 103, 104, 105
 
 class NOTIFYICONDATAW(ctypes.Structure):
     _fields_ = [
@@ -788,10 +814,12 @@ def _tray_menu(hwnd):
     if not menu:
         return 0
     try:
-        MF_STRING, MF_SEPARATOR = 0x0, 0x800
+        MF_STRING, MF_SEPARATOR, MF_CHECKED = 0x0, 0x800, 0x8
         u.AppendMenuW(menu, MF_STRING, MENU_CHECKIN, "지금 출근 체크")
         u.AppendMenuW(menu, MF_STRING, MENU_CHECKOUT, "지금 퇴근 체크")
         u.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+        assume = MF_CHECKED if load_config().get("auto_confirm_already_checked_in") else 0
+        u.AppendMenuW(menu, MF_STRING | assume, MENU_ASSUME_CHECKIN, "이미 출근했으면 묻지 않기")
         u.AppendMenuW(menu, MF_STRING, MENU_OPEN, "상태 창 열기")
         u.AppendMenuW(menu, MF_STRING, MENU_QUIT, "종료(자동 출퇴근 중지)")
         pt = wintypes.POINT()
@@ -845,8 +873,7 @@ def _shutdown_decision(cfg):
     Win32 API에 손대지 않는 순수 로직이라 가짜 설정값으로 그대로 테스트할 수 있다.
     시간 문턱은 두지 않는다 - 조퇴든 뭐든 퇴근 체크가 안 된 채로 끄려 하면 몇 시든 물어봐야
     누락이 조용히 생기지 않는다.
-    OFF_NETWORK만 영구 허용(래치): 사내망이 아닌 게 확인되면 이번 세션 내내 다시 묻지 않는다.
-    NET_UNKNOWN(조회 실패)/ALREADY_DONE은 래치하지 않는다 — 인터넷이 잠깐 끊긴 것뿐일 수 있고,
+    어떤 결과도 래치(영구 허용)하지 않는다 — 인터넷이 잠깐 끊기거나 IP 조회가 한 번 틀렸을 뿐일 수 있고,
     퇴근 여부도 그때그때 바뀌는데 래치해버리면 그날 남은 시간 동안 확인이 영영 안 뜬다."""
     if not cfg.get("shutdown_checkout_check_enabled", True):
         return "FEATURE_OFF"
@@ -903,21 +930,24 @@ def _boot_checkin_worker(sleep=time.sleep):
     메시지 루프(종료 감시)를 막지 않도록 별도 스레드에서 돌리는 것을 전제로 한다."""
     cfg = load_config()
     if not cfg.get("auto_checkin_enabled", True):
+        _log_change("boot", "자동 출근 체크: 꺼져 있어 건너뜀")
         return
     if not cfg.get("office_public_ip") or already_checked_in_today() or checkin_already_asked_today():
-        return
+        return  # 10분마다 도는 정상 경로라 기록하지 않는다
     ip = get_public_ip(timeout=4)
     waited = 0
     while ip is None and waited < BOOT_NET_WAIT_SEC:
         sleep(BOOT_NET_POLL_SEC); waited += BOOT_NET_POLL_SEC
         ip = get_public_ip(timeout=4)
     if ip is None or ip != cfg["office_public_ip"]:
+        _log_change("boot", f"자동 출근 체크: 사내망이 아니거나 인터넷 없음 (현재 IP={ip})")
         return  # 인터넷이 없거나 사내망이 아님: 조용히 넘어간다
     info = ""
     for attempt in range(BOOT_CHECKIN_TRIES):
         if already_checked_in_today():
             return
         ok, info = run_attend("checkin", headless=not cfg.get("debug_show_browser", False), interactive=True)
+        _log(f"자동 출근 체크 시도 {attempt + 1}: ok={ok} {info}")
         if ok:
             return
         if "로그인" in info or "어제 퇴근 체크가 빠졌을 수 있으니" in info:
@@ -988,6 +1018,8 @@ def watch_shutdown():
     WM_ENDSESSION = 0x0016
     WM_CLOSE = 0x0010
     WM_DESTROY = 0x0002
+    ENDSESSION_CLOSEAPP = 0x00000001
+    ENDSESSION_CRITICAL = 0x40000000
     ENDSESSION_LOGOFF = 0x80000000
 
     # LRESULT는 64비트에서 8바이트다 (c_long으로 두면 잘린다).
@@ -1025,13 +1057,16 @@ def watch_shutdown():
     busy = {"value": False}
 
     def on_query_end_session(hwnd, lparam):
+        _log(f"종료 질의 lparam=0x{lparam:08X} allow={allow['value']} busy={busy['value']}")
         if allow["value"]:
             return 1
         if busy["value"]:
             return 0
 
-        # 로그오프/사용자 전환은 '퇴근'이 아니므로 그냥 통과시킨다.
-        if lparam & ENDSESSION_LOGOFF:
+        # 앱 교체/서비싱(CLOSEAPP)은 'PC를 끄는 것'이 아니고, 강제 종료(CRITICAL)는 어차피 막을 수 없다 -> 통과.
+        # LOGOFF는 통과시키면 안 된다: 빠른 시작(Windows 기본값)이 켜져 있으면 '시스템 종료'도 앱에게는
+        # 로그오프(ENDSESSION_LOGOFF)로 전달된다. 이걸 통과시키면 실제로 종료할 때만 영영 안 물어본다.
+        if lparam & (ENDSESSION_CLOSEAPP | ENDSESSION_CRITICAL):
             return 1
 
         # 네트워크를 보기 전에 먼저 안내 문구를 걸어둔다 (조회에 몇 초 걸릴 수 있다).
@@ -1039,11 +1074,11 @@ def watch_shutdown():
         try:
             cfg = load_config()
             decision = _shutdown_decision(cfg)
+            _log(f"  판단={decision}")
 
-            if decision == "OFF_NETWORK":
-                allow["value"] = True   # 사내망이 아닌 게 확인됨 -> 이번 세션엔 다시 묻지 않는다
-                return 1
-            if decision in ("NET_UNKNOWN", "ALREADY_DONE", "FEATURE_OFF"):
+            # OFF_NETWORK도 래치하지 않는다: 한 번 사내망이 아니라고 나왔다고 그날 종료를 영영 통과시키면,
+            # 일시적인 IP 조회 오류 하나로 그날 퇴근 확인이 통째로 사라진다.
+            if decision in ("OFF_NETWORK", "NET_UNKNOWN", "ALREADY_DONE", "FEATURE_OFF"):
                 return 1
 
             # 퇴근 미체크 상태. 정책: "체크될 때까지 매번 다시 물어본다" - 한 번 거절했다고
@@ -1054,6 +1089,7 @@ def watch_shutdown():
             else:
                 _set_block_reason(hwnd, "퇴근 체크가 아직 안 되어 있습니다. 화면이 멈춘 것처럼 보이면 [취소]를 누르고 안내창에서 선택해 주세요.")
                 answer = _confirm_checkout_dialog()
+            _log(f"  응답={answer}")
 
             if answer == "away":
                 # 자리에 사람이 없다 -> 이번 종료는 막지 않는다 (예약 재부팅이 밤새 취소되면 안 된다).
@@ -1064,6 +1100,7 @@ def watch_shutdown():
             if answer == "yes":
                 _set_block_reason(hwnd, "하이웍스 퇴근 체크 중입니다. 끝나면 자동으로 종료됩니다. 잠시만 기다려 주세요.")
                 ok, info = run_attend("checkout", headless=not cfg.get("debug_show_browser", False))
+                _log(f"  퇴근 체크 결과 ok={ok} {info}")
                 if ok:
                     _notify_checkout_success(info)
                 else:
@@ -1086,8 +1123,11 @@ def watch_shutdown():
             # 여기서 예외가 나면 ctypes가 그걸 삼키고 0(=종료 거부)을 돌려준다. 그러면 직원이
             # 컴퓨터를 못 끄게 되므로, 무슨 일이 있어도 종료를 허용하는 쪽으로 빠져나간다.
             try:
-                return on_query_end_session(hwnd, lparam)
-            except Exception:
+                ret = on_query_end_session(hwnd, lparam)
+                _log(f"  -> 반환 {ret} ({'통과' if ret else '종료 취소'})")
+                return ret
+            except Exception as e:
+                _log(f"  -> 예외로 통과: {e!r}")
                 allow["value"] = True
                 busy["value"] = False
                 try: _set_block_reason(hwnd, None)
@@ -1112,6 +1152,10 @@ def watch_shutdown():
                         _tray_action("checkout", hwnd)
                     elif choice == MENU_OPEN:
                         _open_status_window()
+                    elif choice == MENU_ASSUME_CHECKIN:
+                        c = load_config()
+                        c["auto_confirm_already_checked_in"] = not c.get("auto_confirm_already_checked_in")
+                        save_config(c)
                     elif choice == MENU_QUIT:
                         if _confirm_tray_quit():
                             _tray_remove(hwnd)
@@ -1149,6 +1193,7 @@ def watch_shutdown():
     )
 
     _tray_add(hwnd, _tray_tip())
+    _log(f"감시기 시작 v{APP_VERSION} pid={os.getpid()}")
 
     # 부팅 시 자동 출근 체크: 성공하면 알림 없이 넘어가고(미니멀 UI), 끝내 실패했을 때만 알린다.
     # 별도 스레드로 돌려서 메시지 루프가 바로 시작되게 한다 (종료 질의에 즉시 답해야 하므로).
@@ -1452,6 +1497,14 @@ def main_window(auto_minimize=True):
     cb_out.pack(side="left", padx=(10, 0))
     run_sel_btn.pack(side="right")
     buttons.extend([cb_in, cb_out, run_sel_btn])
+
+    assume_var = tk.BooleanVar(value=load_config().get("auto_confirm_already_checked_in", False))
+    def save_assume():
+        c = load_config(); c["auto_confirm_already_checked_in"] = assume_var.get(); save_config(c)
+    ttk.Label(bottom, text="하이웍스에서 이미 출근한 상태로 보이면 물어보지 않고 오늘 출근 완료로 기록합니다",
+              style="Hint.TLabel", wraplength=360).pack(side="bottom", anchor="w", pady=(0, 6))
+    ttk.Checkbutton(bottom, text="이미 출근했으면 묻지 않기", variable=assume_var,
+                    command=save_assume).pack(side="bottom", anchor="w")
 
     if logged_in and auto_minimize:
         state["minimize_job"] = root.after(AUTO_MINIMIZE_MS, root.iconify)
