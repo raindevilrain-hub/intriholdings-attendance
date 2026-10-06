@@ -21,7 +21,7 @@ from tkinter import ttk, messagebox, simpledialog
 from playwright.async_api import async_playwright
 
 APP_NAME = "인트리홀딩스 출근 자동 체크"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 CREDIT = "만든이: 도형이형"
 GITHUB_REPO = "raindevilrain-hub/intriholdings-attendance"  # owner/repo - 깃헙 릴리스에서 최신 버전을 확인한다
 # HTTP 헤더는 latin-1만 허용되어 한글 APP_NAME을 그대로 쓰면 UnicodeEncodeError가 난다.
@@ -137,6 +137,19 @@ def checkin_already_asked_today():
 
 def mark_checkin_asked():
     s = load_state(); s["checkin_asked_date"] = dt.date.today().isoformat(); save_state(s)
+
+def login_failed_today():
+    """오늘 이미 하이웍스 로그인에 실패했으면 같은 틀린 비밀번호로 계속 다시 시도하지 않는다
+    (10분마다 실패 알림이 뜨고, 반복 실패로 계정이 잠길 수도 있다). 비밀번호를 다시 등록하면 풀린다."""
+    return (load_state().get("login_fail") or {}).get("date") == dt.date.today().isoformat()
+
+def mark_login_failed(msg):
+    s = load_state(); s["login_fail"] = {"date": dt.date.today().isoformat(), "msg": msg}; save_state(s)
+
+def clear_login_failed():
+    s = load_state()
+    if s.pop("login_fail", None) is not None:
+        save_state(s)
 
 def update_recently_checked():
     """깃헙에 '실제로 응답을 받은' 마지막 확인 시각 기준. 접속 실패는 확인으로 치지 않는다."""
@@ -278,6 +291,7 @@ def save_credentials(username, password):
     """하이웍스 아이디/비밀번호를 DPAPI로 암호화해 저장한다. 이 PC의 이 Windows 계정으로만
     복호화된다. 저장해 두면 세션이 만료돼도 프로그램이 알아서 다시 로그인한다."""
     CREDS_FILE.write_bytes(_dpapi(json.dumps({"u": username, "p": password}).encode("utf-8"), True))
+    clear_login_failed()  # 새로 등록했으니 '오늘은 로그인 실패라 시도 안 함' 상태를 푼다
 
 def load_credentials():
     try:
@@ -717,10 +731,14 @@ def _notify_checkout_failed(info):
 def _notify_checkin_failed(info):
     # 이 알림도 스스로 닫혀야 한다: 백그라운드 스레드가 여기서 멈춰 있으면 날짜가 바뀌어도
     # 다음 출근 체크를 시작하지 못한다.
-    _msgbox_timeout(
-        f"자동 출근 체크에 실패했습니다.\n사유: {info}\n\n"
-        "프로그램을 다시 열어 수동으로 체크해 주세요.",
-        "출근 체크 실패", MB_ICONWARNING, timeout_ms=120000)
+    if "로그인" in info:
+        hint = ("하이웍스 비밀번호가 바뀌었다면 프로그램(상태 창) 위쪽의 '로그인 정보 다시 입력'으로 새로 등록해 주세요.\n"
+                "이미 직접 출근 체크를 하셨다면 상태 창에서 '오늘 출근' 옆 '이미 했어요'를 누르세요.\n"
+                "(오늘은 이 알림이 다시 뜨지 않습니다)")
+    else:
+        hint = "프로그램을 다시 열어 수동으로 체크해 주세요."
+    _msgbox_timeout(f"자동 출근 체크에 실패했습니다.\n사유: {info}\n\n{hint}",
+                    "출근 체크 실패", MB_ICONWARNING, timeout_ms=120000)
 
 # ---------- 트레이 아이콘 ----------
 # 감시기(watch)는 이미 숨은 창 + 메시지 루프를 갖고 있어서, 거기에 트레이 아이콘을 붙인다.
@@ -731,6 +749,7 @@ TRAY_UID = 1
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO = 0x01, 0x02, 0x04, 0x10
 MENU_CHECKIN, MENU_CHECKOUT, MENU_OPEN, MENU_QUIT, MENU_ASSUME_CHECKIN, MENU_UPDATE = 101, 102, 103, 104, 105, 106
+MENU_MARK_IN, MENU_MARK_OUT = 107, 108
 
 class NOTIFYICONDATAW(ctypes.Structure):
     _fields_ = [
@@ -834,6 +853,8 @@ def _tray_menu(hwnd):
         u.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         assume = MF_CHECKED if load_config().get("auto_confirm_already_checked_in") else 0
         u.AppendMenuW(menu, MF_STRING | assume, MENU_ASSUME_CHECKIN, "이미 출근했으면 묻지 않기")
+        u.AppendMenuW(menu, MF_STRING, MENU_MARK_IN, "오늘 출근 이미 했어요 (완료로 표시)")
+        u.AppendMenuW(menu, MF_STRING, MENU_MARK_OUT, "오늘 퇴근 이미 했어요 (완료로 표시)")
         u.AppendMenuW(menu, MF_STRING, MENU_OPEN, "상태 창 열기")
         u.AppendMenuW(menu, MF_STRING, MENU_UPDATE, f"업데이트 확인 (현재 v{APP_VERSION})")
         u.AppendMenuW(menu, MF_STRING, MENU_QUIT, "종료(자동 출퇴근 중지)")
@@ -868,6 +889,24 @@ def _tray_action(mode, hwnd):
         label = "출근" if mode == "checkin" else "퇴근"
         _msgbox_timeout(f"{label} 체크 결과\n\n{info}", APP_NAME,
                         0x40 if ok else MB_ICONWARNING, timeout_ms=15000)
+    threading.Thread(target=work, daemon=True).start()
+
+def _tray_mark_done(kind, hwnd):
+    """트레이 메뉴 '오늘 출근/퇴근 이미 했어요'. 하이웍스에는 아무것도 하지 않고 이 프로그램의 기록만 완료로 맞춘다.
+    메시지 루프를 막지 않게 스레드에서 확인창을 띄운다."""
+    label = "출근" if kind == "checkin" else "퇴근"
+    def work():
+        r = _msgbox_timeout(f"하이웍스에서 오늘 {label} 체크를 이미 하셨나요?\n\n"
+                            f"이 프로그램의 기록만 '오늘 {label} 완료'로 바꿉니다 (하이웍스에는 아무것도 하지 않습니다).",
+                            APP_NAME, MB_YESNO | MB_ICONQUESTION, timeout_ms=30000)
+        if r != IDYES:
+            return
+        (mark_checkin if kind == "checkin" else mark_checkout)()
+        try:
+            _tray_update(hwnd, _tray_tip())
+        except Exception:
+            pass
+        _msgbox_timeout(f"오늘 {label}을(를) 완료로 표시했습니다.", APP_NAME, MB_ICONINFORMATION, timeout_ms=5000)
     threading.Thread(target=work, daemon=True).start()
 
 def _tray_update_action():
@@ -993,6 +1032,9 @@ def _boot_checkin_worker(sleep=time.sleep):
     if checkin_already_asked_today():
         _log_change("boot", "자동 출근 체크 건너뜀: 오늘 '이미 출근하셨나요?'를 이미 물어봄")
         return
+    if login_failed_today():
+        _log_change("boot", "자동 출근 체크 건너뜀: 오늘 하이웍스 로그인에 이미 실패함 (로그인 정보를 다시 등록해야 함)")
+        return
     _log_change("boot", "자동 출근 체크: 시작 (사내망 확인 중)")
     ip = get_public_ip(timeout=4)
     waited = 0
@@ -1010,8 +1052,11 @@ def _boot_checkin_worker(sleep=time.sleep):
         _log(f"자동 출근 체크 시도 {attempt + 1}: ok={ok} {info}")
         if ok:
             return
-        if "로그인" in info or "어제 퇴근 체크가 빠졌을 수 있으니" in info:
-            break  # 로그인 문제/출근 모호 상태(이미 물어봤음)는 재시도해도 같은 결과다
+        if "로그인" in info:
+            mark_login_failed(info)  # 오늘은 같은 비밀번호로 다시 시도하지 않는다 (알림 반복 + 계정 잠김 방지)
+            break
+        if "어제 퇴근 체크가 빠졌을 수 있으니" in info:
+            break  # 출근 모호 상태(이미 물어봤음)는 재시도해도 같은 결과다
         if attempt < BOOT_CHECKIN_TRIES - 1:
             sleep(BOOT_RETRY_GAP_SEC)
     _notify_checkin_failed(info)
@@ -1214,6 +1259,10 @@ def watch_shutdown():
                         _open_status_window()
                     elif choice == MENU_UPDATE:
                         _tray_update_action()
+                    elif choice == MENU_MARK_IN:
+                        _tray_mark_done("checkin", hwnd)
+                    elif choice == MENU_MARK_OUT:
+                        _tray_mark_done("checkout", hwnd)
                     elif choice == MENU_ASSUME_CHECKIN:
                         c = load_config()
                         c["auto_confirm_already_checked_in"] = not c.get("auto_confirm_already_checked_in")
@@ -1385,13 +1434,19 @@ def _network_text():
         return "네트워크를 확인할 수 없습니다 (인터넷 연결 확인)"
     return "사내망이 아니라서 자동 출퇴근이 동작하지 않습니다"
 
-def _status_pill(parent, label, done):
+def _status_pill(parent, label, done, on_mark=None):
+    """on_mark를 주면 '미완료'일 때 옆에 '이미 했어요'(하이웍스에서 직접 했을 때 이 프로그램 기록만 완료로 표시)가 붙는다."""
     row = ttk.Frame(parent, style="Card.TFrame"); row.pack(fill="x", pady=3)
     ttk.Label(row, text=label, style="Status.TLabel").pack(side="left")
     color = COLOR_SUCCESS if done else COLOR_HINT
     text = "완료" if done else "미완료"
     tk.Label(row, text=text, bg=color, fg="#FFFFFF", font=("Malgun Gothic", 9, "bold"),
              padx=10, pady=2).pack(side="right")
+    if on_mark and not done:
+        link = tk.Label(row, text="이미 했어요", fg=COLOR_ACCENT, bg=COLOR_CARD, cursor="hand2",
+                        font=("Malgun Gothic", 9, "underline"))
+        link.pack(side="right", padx=(0, 10))
+        link.bind("<Button-1>", lambda e: on_mark())
 
 AUTO_MINIMIZE_MS = 2500
 
@@ -1421,11 +1476,36 @@ def main_window(auto_minimize=True):
     for ev in ("<Button-1>", "<Key>", "<MouseWheel>"):
         root.bind_all(ev, cancel_auto_minimize, add="+")
 
+    def relogin():
+        """비밀번호가 바뀌어 저장된 로그인 정보가 거부될 때, 관리자 PIN 없이도 본인이 새로 입력할 수 있게 한다.
+        회사망 설정(setup_complete/IP)은 건드리지 않는다 - 집에서 다시 입력해도 집이 회사망으로 등록되면 안 된다."""
+        cancel_auto_minimize()
+        if not messagebox.askyesno("로그인 정보 다시 입력",
+                                   "저장된 하이웍스 아이디/비밀번호를 지우고 새로 입력할까요?\n\n"
+                                   "(회사망 설정은 그대로 유지됩니다)", parent=root):
+            return
+        clear_credentials()
+        try: SESSION_FILE.unlink(missing_ok=True)
+        except Exception: pass
+        root.destroy()
+        main_window(auto_minimize=False)   # 등록 화면으로 새로 연다
+
     # ---- 상단: 로그인 상태 또는 등록 폼 ----
     if logged_in:
         _header(frm, subtitle="로그인이 되어 있네요 :)")
         saved_id, _ = load_credentials()
-        ttk.Label(frm, text=f"저장된 아이디: {saved_id}", style="Hint.TLabel").pack(anchor="w", pady=(6, 0))
+        id_row = ttk.Frame(frm, style="Card.TFrame"); id_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(id_row, text=f"저장된 아이디: {saved_id}", style="Hint.TLabel").pack(side="left")
+        relogin_link = tk.Label(id_row, text="로그인 정보 다시 입력", fg=COLOR_ACCENT, bg=COLOR_CARD,
+                                cursor="hand2", font=("Malgun Gothic", 8, "underline"))
+        relogin_link.pack(side="right")
+        # 창을 닫는 동작이라, 같은 클릭의 뒤처리(전체 바인딩)가 이미 사라진 명령을 부르지 않게 "break"로 끊는다.
+        relogin_link.bind("<Button-1>", lambda e: (relogin(), "break")[1])
+        if login_failed_today():
+            tk.Label(frm, text="⚠ 오늘 자동 로그인에 실패했습니다. 하이웍스 비밀번호가 바뀌었다면 "
+                               "'로그인 정보 다시 입력'으로 새로 등록해 주세요.",
+                     fg=COLOR_DANGER, bg=COLOR_CARD, wraplength=370, justify="left",
+                     font=("Malgun Gothic", 9)).pack(anchor="w", pady=(6, 0))
     else:
         _header(frm, subtitle="처음 한 번만 로그인 정보를 입력하면 됩니다.")
         ttk.Frame(frm, style="Card.TFrame", height=18).pack()
@@ -1444,9 +1524,23 @@ def main_window(auto_minimize=True):
     status_holder = ttk.Frame(frm, style="Card.TFrame"); status_holder.pack(fill="x")
     def redraw_status():
         for w in status_holder.winfo_children(): w.destroy()
-        _status_pill(status_holder, "오늘 출근", already_checked_in_today())
-        _status_pill(status_holder, "오늘 퇴근", already_checked_out_today())
+        _status_pill(status_holder, "오늘 출근", already_checked_in_today(), on_mark=lambda: mark_done("checkin"))
+        _status_pill(status_holder, "오늘 퇴근", already_checked_out_today(), on_mark=lambda: mark_done("checkout"))
     redraw_status()
+
+    def mark_done(kind):
+        """하이웍스(휴대폰 등)에서 직접 출/퇴근 체크를 했을 때, 이 프로그램의 기록만 '완료'로 맞춘다.
+        하이웍스에는 아무것도 하지 않는다. 기록이 맞아야 자동 출근 재시도/알림, 종료 시 퇴근 확인이 더는 안 뜬다."""
+        cancel_auto_minimize()
+        label = "출근" if kind == "checkin" else "퇴근"
+        if not messagebox.askyesno("이미 했어요",
+                                   f"하이웍스에서 오늘 {label} 체크를 이미 하셨나요?\n\n"
+                                   f"이 프로그램의 기록만 '오늘 {label} 완료'로 바꿉니다 (하이웍스에는 아무것도 하지 않습니다).",
+                                   parent=root):
+            return
+        (mark_checkin if kind == "checkin" else mark_checkout)()
+        redraw_status()
+        result_lbl.configure(text=f"오늘 {label}을(를) 완료로 표시했습니다.")
 
     net_lbl = ttk.Label(frm, text="네트워크 확인 중...", style="Hint.TLabel", wraplength=360)
     net_lbl.pack(anchor="w", pady=(10, 0))
